@@ -1,13 +1,15 @@
 /**
- * EdgeOne Pages proxy function (修复链接重写)
+ * EdgeOne Pages proxy function (完整修复版)
  * 
- * 修复：正确拼接目标网站的域名
+ * 完整解决方案：
+ * 1. 重写 HTML 中的链接和表单
+ * 2. 注入 JavaScript 拦截所有动态导航
+ * 3. 添加 <base> 标签处理相对路径
  */
 
 export async function onRequest(context) {
     const { request } = context;
 
-    // 处理 CORS 预检请求
     if (request.method === 'OPTIONS') {
         return new Response(null, {
             status: 204,
@@ -27,7 +29,6 @@ export async function onRequest(context) {
             return new Response('Missing url parameter', { status: 400 });
         }
 
-        // URL 解码和规范化
         let targetUrlStr = targetUrlParam;
         try {
             if (targetUrlStr.includes('%')) {
@@ -39,13 +40,13 @@ export async function onRequest(context) {
         } catch (e) {}
 
         const targetUrl = new URL(targetUrlStr);
-        const targetOrigin = targetUrl.origin; // 例如：https://www.google.com
+        const targetOrigin = targetUrl.origin;
+        const currentProxyUrl = targetUrlStr; // 当前代理的完整目标 URL
 
         if (!['http:', 'https:'].includes(targetUrl.protocol)) {
             return new Response('Only http and https protocols are supported.', { status: 400 });
         }
 
-        // 构建请求头
         const outgoingHeaders = new Headers();
         
         const headersToCopy = ['accept', 'accept-language', 'user-agent', 'cookie', 'referer'];
@@ -72,7 +73,6 @@ export async function onRequest(context) {
 
         const response = await fetch(modifiedRequest);
 
-        // 处理重定向
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             const location = response.headers.get('location');
             if (location) {
@@ -87,7 +87,6 @@ export async function onRequest(context) {
             }
         }
 
-        // 构建响应头
         const finalHeaders = new Headers();
 
         const skipHeaders = ['content-encoding', 'transfer-encoding', 'content-length', 'set-cookie'];
@@ -97,7 +96,6 @@ export async function onRequest(context) {
             }
         }
 
-        // Cookie 重写
         const rewriteSetCookie = (cookie) => {
             if (!cookie) return cookie;
             return cookie
@@ -120,17 +118,13 @@ export async function onRequest(context) {
         finalHeaders.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
         finalHeaders.set('Access-Control-Allow-Headers', '*');
 
-        // HTML 重写
         const contentType = response.headers.get('content-type') || '';
         
         if (contentType.includes('text/html')) {
             let html = await response.text();
             
-            // 使用正确的基础 URL
-            const baseUrl = targetOrigin; // 例如：https://www.google.com
-            
-            // 重写链接
-            html = rewriteHtmlUrls(html, baseUrl);
+            // 注入拦截脚本和重写的 URL
+            html = injectProxyScript(html, currentProxyUrl, targetOrigin);
             
             return new Response(html, {
                 status: response.status,
@@ -139,7 +133,6 @@ export async function onRequest(context) {
             });
         }
         
-        // 非 HTML 内容
         return new Response(response.body, {
             status: response.status,
             statusText: response.statusText,
@@ -152,25 +145,144 @@ export async function onRequest(context) {
 }
 
 /**
- * 重写 HTML 中的所有 URL
+ * 注入代理脚本和重写 HTML
  */
-function rewriteHtmlUrls(html, baseUrl) {
-    // 1. 重写 <a href="...">
-    html = html.replace(/<a([^>]*?)href=["']([^"']*)["']([^>]*?)>/gi, (match, before, href, after) => {
-        const newHref = rewriteSingleUrl(href, baseUrl);
-        return `<a${before}href="${newHref}"${after}>`;
+function injectProxyScript(html, currentTargetUrl, targetOrigin) {
+    // 1. 重写静态的链接和表单
+    html = rewriteStaticUrls(html, targetOrigin);
+    
+    // 2. 注入 JavaScript 来拦截动态导航
+    const proxyScript = `
+<script>
+(function() {
+    var currentTargetUrl = "${currentTargetUrl}";
+    var targetOrigin = "${targetOrigin}";
+    var proxyBase = "/proxy?url=";
+    
+    // 重写 URL 的函数
+    function rewriteUrl(url) {
+        if (!url || url.startsWith('#') || url.startsWith('javascript:') || url.startsWith('data:')) {
+            return url;
+        }
+        
+        // 已经是代理 URL
+        if (url.startsWith('/proxy?')) {
+            return url;
+        }
+        
+        // 绝对 URL
+        if (url.startsWith('http://') || url.startsWith('https://')) {
+            return proxyBase + encodeURIComponent(url);
+        }
+        
+        // 协议相对 URL
+        if (url.startsWith('//')) {
+            return proxyBase + encodeURIComponent('https:' + url);
+        }
+        
+        // 相对路径
+        if (url.startsWith('/')) {
+            return proxyBase + encodeURIComponent(targetOrigin + url);
+        }
+        
+        // 相对路径（./ 或 ../）
+        return proxyBase + encodeURIComponent(targetOrigin + '/' + url);
+    }
+    
+    // 拦截所有链接点击
+    document.addEventListener('click', function(e) {
+        var target = e.target.closest('a');
+        if (target && target.href) {
+            e.preventDefault();
+            var newUrl = rewriteUrl(target.href);
+            window.open(newUrl, '_blank');
+        }
+    }, true);
+    
+    // 拦截所有表单提交
+    document.addEventListener('submit', function(e) {
+        var form = e.target;
+        if (form.action) {
+            e.preventDefault();
+            var newAction = rewriteUrl(form.action);
+            
+            // 创建新的表单并提交
+            var newForm = document.createElement('form');
+            newForm.method = form.method || 'GET';
+            newForm.action = newAction;
+            
+            // 复制表单数据
+            var formData = new FormData(form);
+            for (var pair of formData.entries()) {
+                var input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = pair[0];
+                input.value = pair[1];
+                newForm.appendChild(input);
+            }
+            
+            document.body.appendChild(newForm);
+            newForm.submit();
+            document.body.removeChild(newForm);
+        }
+    }, true);
+    
+    // 拦截 window.open 和 location changes
+    var originalOpen = window.open;
+    window.open = function(url) {
+        if (url) {
+            arguments[0] = rewriteUrl(url);
+        }
+        return originalOpen.apply(this, arguments);
+    };
+    
+    // 重写 <base> 标签的 href
+    var baseTag = document.querySelector('base');
+    if (baseTag) {
+        baseTag.href = '/proxy?url=' + encodeURIComponent(targetOrigin + '/');
+    }
+})();
+</script>
+`;
+    
+    // 在 </head> 前注入脚本
+    if (html.includes('</head>')) {
+        html = html.replace('</head>', proxyScript + '</head>');
+    } else if (html.includes('</body>')) {
+        html = html.replace('</body>', proxyScript + '</body>');
+    } else {
+        html += proxyScript;
+    }
+    
+    return html;
+}
+
+/**
+ * 重写静态的 URL（链接、表单等）
+ */
+function rewriteStaticUrls(html, baseUrl) {
+    // 重写 <a href>
+    html = html.replace(/<a([^>]*?)href=["']([^"']*)["']([^>]*?)>/gi, function(match, before, href, after) {
+        if (!href || href.startsWith('#') || href.startsWith('javascript:')) {
+            return match;
+        }
+        var newHref = rewriteSingleUrl(href, baseUrl);
+        return '<a' + before + 'href="' + newHref + '"' + after + '>';
     });
     
-    // 2. 重写 <form action="...">
-    html = html.replace(/<form([^>]*?)action=["']([^"']*)["']([^>]*?)>/gi, (match, before, action, after) => {
-        const newAction = rewriteSingleUrl(action, baseUrl);
-        return `<form${before}action="${newAction}"${after}>`;
+    // 重写 <form action>
+    html = html.replace(/<form([^>]*?)action=["']([^"']*)["']([^>]*?)>/gi, function(match, before, action, after) {
+        if (!action) return match;
+        var newAction = rewriteSingleUrl(action, baseUrl);
+        return '<form' + before + 'action="' + newAction + '"' + after + '>';
     });
     
-    // 3. 重写资源 URL (src, href in non-a/form tags)
-    html = html.replace(/(<(?:img|script|link|iframe)[^>]*?)(src|href)=["']([^"']*)["']([^>]*?>)/gi, (match, tagStart, attr, url, tagEnd) => {
-        const newUrl = rewriteSingleUrl(url, baseUrl);
-        return `${tagStart}${attr}="${newUrl}"${tagEnd}`;
+    // 重写资源 URL
+    html = html.replace(/(src|href)=["']([^"']*)["']/gi, function(match, attr, url) {
+        if (match.includes('<a ') || match.includes('<form ')) return match;
+        if (!url || url.startsWith('#') || url.startsWith('data:')) return match;
+        var newUrl = rewriteSingleUrl(url, baseUrl);
+        return attr + '="' + newUrl + '"';
     });
     
     return html;
@@ -184,29 +296,22 @@ function rewriteSingleUrl(url, baseUrl) {
         return url;
     }
     
-    // 已经是代理 URL
     if (url.startsWith('/proxy?')) {
         return url;
     }
     
-    // 绝对 URL
     if (url.startsWith('http://') || url.startsWith('https://')) {
-        return `/proxy?url=${encodeURIComponent(url)}`;
+        return '/proxy?url=' + encodeURIComponent(url);
     }
     
-    // 协议相对 URL
     if (url.startsWith('//')) {
-        return `/proxy?url=${encodeURIComponent('https:' + url)}`;
+        return '/proxy?url=' + encodeURIComponent('https:' + url);
     }
     
-    // 根相对路径 (以 / 开头)
     if (url.startsWith('/')) {
-        return `/proxy?url=${encodeURIComponent(baseUrl + url)}`;
+        return '/proxy?url=' + encodeURIComponent(baseUrl + url);
     }
     
-    // 相对路径 (如 "./page" 或 "../page")
-    // 简单处理：直接拼接到 baseUrl 后面
-    // 更完整的实现应该基于当前页面的 URL 解析
-    const separator = baseUrl.endsWith('/') ? '' : '/';
-    return `/proxy?url=${encodeURIComponent(baseUrl + separator + url)}`;
+    var separator = baseUrl.endsWith('/') ? '' : '/';
+    return '/proxy?url=' + encodeURIComponent(baseUrl + separator + url);
 }
