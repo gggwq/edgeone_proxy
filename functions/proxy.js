@@ -1,16 +1,14 @@
 /**
- * EdgeOne Pages proxy function (调试版)
+ * EdgeOne Pages proxy function (智能修复版)
  * 
- * 添加详细日志来帮助诊断问题
+ * 核心改进：
+ * 1. 当请求 /proxy 缺少 url 参数时，尝试从 Referer 中提取
+ * 2. 自动修复表单 action，添加当前目标 URL 作为隐藏字段
+ * 3. 注入 JS 确保所有导航都通过代理
  */
 
 export async function onRequest(context) {
     const { request } = context;
-
-    // 日志函数
-    const log = (msg) => {
-        console.log(`[Proxy] ${msg}`);
-    };
 
     if (request.method === 'OPTIONS') {
         return new Response(null, {
@@ -25,19 +23,43 @@ export async function onRequest(context) {
 
     try {
         const requestUrl = new URL(request.url);
-        const targetUrlParam = requestUrl.searchParams.get('url') || requestUrl.searchParams.get('u');
+        let targetUrlParam = requestUrl.searchParams.get('url') || requestUrl.searchParams.get('u');
 
-        log(`Request URL: ${request.url}`);
-        log(`Target URL param: ${targetUrlParam}`);
-
+        // 关键修复：如果没有 url 参数，尝试从 Referer 中提取
         if (!targetUrlParam) {
-            // 诊断：显示所有查询参数
-            const allParams = {};
-            for (const [key, value] of requestUrl.searchParams.entries()) {
-                allParams[key] = value;
+            const referer = request.headers.get('referer');
+            if (referer) {
+                try {
+                    const refererUrl = new URL(referer);
+                    targetUrlParam = refererUrl.searchParams.get('url') || refererUrl.searchParams.get('u');
+                    
+                    if (targetUrlParam) {
+                        // 重定向到正确的代理 URL
+                        const currentPath = requestUrl.pathname;
+                        const currentParams = new URLSearchParams(requestUrl.search);
+                        
+                        // 构造新的代理 URL，保留原始查询参数
+                        let newProxyUrl = `/proxy?url=${encodeURIComponent(targetUrlParam)}`;
+                        
+                        // 添加原始的查询参数（如 Google 的 q=1+1）
+                        for (const [key, value] of currentParams.entries()) {
+                            if (key !== 'url' && key !== 'u') {
+                                newProxyUrl += `&${key}=${encodeURIComponent(value)}`;
+                            }
+                        }
+                        
+                        return new Response(null, {
+                            status: 302,
+                            headers: {
+                                'Location': newProxyUrl,
+                                'Access-Control-Allow-Origin': '*'
+                            }
+                        });
+                    }
+                } catch (e) {}
             }
-            log(`Missing url parameter. All params: ${JSON.stringify(allParams)}`);
             
+            // 如果还是没有 url 参数，返回错误
             return new Response('Missing url parameter. Please use /proxy?url=<target_url>', { 
                 status: 400,
                 headers: {
@@ -55,15 +77,10 @@ export async function onRequest(context) {
             if (!targetUrlStr.startsWith('http')) {
                 targetUrlStr = 'https://' + targetUrlStr;
             }
-        } catch (e) {
-            log(`URL decode error: ${e.message}`);
-        }
+        } catch (e) {}
 
         const targetUrl = new URL(targetUrlStr);
         const targetOrigin = targetUrl.origin;
-
-        log(`Target URL: ${targetUrl.href}`);
-        log(`Target Origin: ${targetOrigin}`);
 
         if (!['http:', 'https:'].includes(targetUrl.protocol)) {
             return new Response('Only http and https protocols are supported.', { status: 400 });
@@ -85,8 +102,6 @@ export async function onRequest(context) {
             outgoingHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
         }
 
-        log(`Fetching: ${targetUrl.href}`);
-
         const modifiedRequest = new Request(targetUrl.href, {
             headers: outgoingHeaders,
             method: request.method,
@@ -97,13 +112,10 @@ export async function onRequest(context) {
 
         const response = await fetch(modifiedRequest);
 
-        log(`Response status: ${response.status}`);
-
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             const location = response.headers.get('location');
             if (location) {
                 const redirectUrl = new URL(location, targetUrl).href;
-                log(`Redirect to: ${redirectUrl}`);
                 return new Response(null, {
                     status: 302,
                     headers: {
@@ -150,10 +162,8 @@ export async function onRequest(context) {
         if (contentType.includes('text/html')) {
             let html = await response.text();
             
-            log(`HTML length: ${html.length}`);
-            
-            // 注入调试脚本和重写 URL
-            html = injectProxyScriptDebug(html, targetUrlStr, targetOrigin);
+            // 注入智能修复脚本
+            html = injectSmartFix(html, targetUrlStr, targetOrigin);
             
             return new Response(html, {
                 status: response.status,
@@ -162,8 +172,6 @@ export async function onRequest(context) {
             });
         }
         
-        log(`Non-HTML response, content-type: ${contentType}`);
-        
         return new Response(response.body, {
             status: response.status,
             statusText: response.statusText,
@@ -171,201 +179,136 @@ export async function onRequest(context) {
         });
 
     } catch (error) {
-        log(`Error: ${error.message}`);
-        log(`Stack: ${error.stack}`);
-        return new Response(`Proxy Error: ${error.message}<br><br>Stack: ${error.stack}`, { 
-            status: 500,
-            headers: {
-                'Content-Type': 'text/html; charset=utf-8'
-            }
-        });
+        return new Response(`Proxy Error: ${error.message}`, { status: 500 });
     }
 }
 
 /**
- * 注入代理脚本（调试版）
+ * 注入智能修复脚本
  */
-function injectProxyScriptDebug(html, currentTargetUrl, targetOrigin) {
-    log(`Rewriting HTML...`);
+function injectSmartFix(html, targetUrlStr, targetOrigin) {
+    const proxyBase = '/proxy?url=';
     
-    // 1. 重写静态的链接和表单
-    html = rewriteStaticUrls(html, targetOrigin);
+    // 1. 添加隐藏的 url 字段到所有表单
+    html = html.replace(/<form([^>]*)>/gi, (match, attrs) => {
+        // 检查是否已经有 action
+        if (!attrs.includes('action=')) {
+            // 没有 action，添加当前目标 URL 作为 action
+            return `<form${attrs} action="${proxyBase}${encodeURIComponent(targetUrlStr)}">`;
+        }
+        return match;
+    });
     
-    log(`Static URLs rewritten`);
-    
-    // 2. 注入 JavaScript（调试版）
-    const proxyScript = `
+    // 2. 注入 JavaScript 来修复表单提交
+    const fixScript = `
 <script>
 (function() {
-    var currentTargetUrl = "${currentTargetUrl}";
+    var targetUrl = "${targetUrlStr}";
     var targetOrigin = "${targetOrigin}";
     var proxyBase = "/proxy?url=";
     
-    console.log("[Proxy Debug] Script loaded");
-    console.log("[Proxy Debug] currentTargetUrl:", currentTargetUrl);
-    console.log("[Proxy Debug] targetOrigin:", targetOrigin);
-    
-    // 重写 URL 的函数
-    function rewriteUrl(url) {
-        if (!url || url.startsWith('#') || url.startsWith('javascript:') || url.startsWith('data:')) {
-            return url;
-        }
-        
-        console.log("[Proxy Debug] Rewriting URL:", url);
-        
-        // 已经是代理 URL
-        if (url.startsWith('/proxy?')) {
-            console.log("[Proxy Debug] Already proxied, skipping");
-            return url;
-        }
-        
-        // 绝对 URL
-        if (url.startsWith('http://') || url.startsWith('https://')) {
-            var result = proxyBase + encodeURIComponent(url);
-            console.log("[Proxy Debug] Absolute URL rewritten to:", result);
-            return result;
-        }
-        
-        // 协议相对 URL
-        if (url.startsWith('//')) {
-            return proxyBase + encodeURIComponent('https:' + url);
-        }
-        
-        // 相对路径
-        if (url.startsWith('/')) {
-            return proxyBase + encodeURIComponent(targetOrigin + url);
-        }
-        
-        // 相对路径（./ 或 ../）
-        return proxyBase + encodeURIComponent(targetOrigin + '/' + url);
-    }
-    
-    // 拦截所有链接点击
-    document.addEventListener('click', function(e) {
-        console.log("[Proxy Debug] Click intercepted", e.target);
-        var target = e.target.closest('a');
-        if (target && target.href) {
-            e.preventDefault();
-            var newUrl = rewriteUrl(target.href);
-            console.log("[Proxy Debug] Opening:", newUrl);
-            window.open(newUrl, '_blank');
-        }
-    }, true);
-    
-    // 拦截所有表单提交
+    // 修复所有表单提交
     document.addEventListener('submit', function(e) {
-        console.log("[Proxy Debug] Form submit intercepted", e.target);
         var form = e.target;
-        if (form.action) {
+        
+        // 获取表单的 action
+        var action = form.getAttribute('action') || '';
+        
+        // 如果 action 不包含 /proxy?，需要重写
+        if (action && !action.includes('/proxy?')) {
             e.preventDefault();
-            console.log("[Proxy Debug] Original action:", form.action);
-            var newAction = rewriteUrl(form.action);
-            console.log("[Proxy Debug] New action:", newAction);
             
-            // 创建新的表单并提交
-            var newForm = document.createElement('form');
-            newForm.method = form.method || 'GET';
-            newForm.action = newAction;
-            
-            // 复制表单数据
-            var formData = new FormData(form);
-            for (var pair of formData.entries()) {
-                console.log("[Proxy Debug] Form field:", pair[0], pair[1]);
-                var input = document.createElement('input');
-                input.type = 'hidden';
-                input.name = pair[0];
-                input.value = pair[1];
-                newForm.appendChild(input);
+            // 构造完整的目标 URL
+            var fullAction;
+            if (action.startsWith('http')) {
+                fullAction = action;
+            } else if (action.startsWith('/')) {
+                fullAction = targetOrigin + action;
+            } else if (action.startsWith('./') || action.startsWith('../')) {
+                // 相对路径，基于当前 targetUrl
+                var base = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+                fullAction = new URL(action, base).href;
+            } else {
+                // 可能是空 action，使用当前页面
+                fullAction = targetUrl;
             }
             
-            document.body.appendChild(newForm);
-            newForm.submit();
-            document.body.removeChild(newForm);
+            // 构造代理 URL
+            var proxyUrl = proxyBase + encodeURIComponent(fullAction);
+            
+            // 添加表单数据作为查询参数
+            var formData = new FormData(form);
+            var params = new URLSearchParams();
+            for (var pair of formData.entries()) {
+                params.append(pair[0], pair[1]);
+            }
+            
+            var paramStr = params.toString();
+            if (paramStr) {
+                proxyUrl += (fullAction.includes('?') ? '&' : '?') + paramStr;
+            }
+            
+            // 提交到代理 URL
+            if (form.method.toUpperCase() === 'GET') {
+                window.location.href = proxyUrl;
+            } else {
+                // POST 请求，创建新表单
+                var newForm = document.createElement('form');
+                newForm.method = 'POST';
+                newForm.action = proxyUrl;
+                
+                for (var pair of formData.entries()) {
+                    var input = document.createElement('input');
+                    input.type = 'hidden';
+                    input.name = pair[0];
+                    input.value = pair[1];
+                    newForm.appendChild(input);
+                }
+                
+                document.body.appendChild(newForm);
+                newForm.submit();
+            }
         }
     }, true);
     
-    // 重写 <base> 标签
-    var baseTag = document.querySelector('base');
-    if (baseTag) {
-        baseTag.href = '/proxy?url=' + encodeURIComponent(targetOrigin + '/');
-        console.log("[Proxy Debug] Base tag rewritten to:", baseTag.href);
-    }
-    
-    console.log("[Proxy Debug] All interceptors installed");
+    // 修复所有链接点击
+    document.addEventListener('click', function(e) {
+        var link = e.target.closest('a');
+        if (link && link.href) {
+            var href = link.getAttribute('href');
+            
+            // 如果链接不是代理 URL，重写
+            if (href && !href.includes('/proxy?') && !href.startsWith('#') && !href.startsWith('javascript:')) {
+                e.preventDefault();
+                
+                var fullUrl;
+                if (href.startsWith('http')) {
+                    fullUrl = href;
+                } else if (href.startsWith('/')) {
+                    fullUrl = targetOrigin + href;
+                } else if (href.startsWith('./') || href.startsWith('../')) {
+                    var base = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+                    fullUrl = new URL(href, base).href;
+                } else {
+                    fullUrl = targetUrl + '/' + href;
+                }
+                
+                window.open(proxyBase + encodeURIComponent(fullUrl), '_blank');
+            }
+        }
+    }, true);
 })();
 </script>
 `;
     
-    // 在 </head> 前注入脚本
+    // 注入脚本
     if (html.includes('</head>')) {
-        html = html.replace('</head>', proxyScript + '</head>');
-        log(`Script injected before </head>`);
+        html = html.replace('</head>', fixScript + '</head>');
     } else if (html.includes('</body>')) {
-        html = html.replace('</body>', proxyScript + '</body>');
-        log(`Script injected before </body>`);
+        html = html.replace('</body>', fixScript + '</body>');
     } else {
-        html += proxyScript;
-        log(`Script appended to end`);
+        html += fixScript;
     }
     
     return html;
-}
-
-/**
- * 重写静态的 URL
- */
-function rewriteStaticUrls(html, baseUrl) {
-    // 重写 <a href>
-    html = html.replace(/<a([^>]*?)href=["']([^"']*)["']([^>]*?)>/gi, function(match, before, href, after) {
-        if (!href || href.startsWith('#') || href.startsWith('javascript:')) {
-            return match;
-        }
-        var newHref = rewriteSingleUrl(href, baseUrl);
-        return '<a' + before + 'href="' + newHref + '"' + after + '>';
-    });
-    
-    // 重写 <form action>
-    html = html.replace(/<form([^>]*?)action=["']([^"']*)["']([^>]*?)>/gi, function(match, before, action, after) {
-        if (!action) {
-            // 没有 action，使用当前 URL
-            action = baseUrl + '/';
-        }
-        console.log(`[Rewrite] Form action: ${action} -> ${rewriteSingleUrl(action, baseUrl)}`);
-        var newAction = rewriteSingleUrl(action, baseUrl);
-        return '<form' + before + 'action="' + newAction + '"' + after + '>';
-    });
-    
-    return html;
-}
-
-/**
- * 重写单个 URL
- */
-function rewriteSingleUrl(url, baseUrl) {
-    if (!url || url.startsWith('#') || url.startsWith('javascript:') || url.startsWith('data:')) {
-        return url;
-    }
-    
-    if (url.startsWith('/proxy?')) {
-        return url;
-    }
-    
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-        return '/proxy?url=' + encodeURIComponent(url);
-    }
-    
-    if (url.startsWith('//')) {
-        return '/proxy?url=' + encodeURIComponent('https:' + url);
-    }
-    
-    if (url.startsWith('/')) {
-        return '/proxy?url=' + encodeURIComponent(baseUrl + url);
-    }
-    
-    var separator = baseUrl.endsWith('/') ? '' : '/';
-    return '/proxy?url=' + encodeURIComponent(baseUrl + separator + url);
-}
-
-function log(msg) {
-    console.log(msg);
 }
