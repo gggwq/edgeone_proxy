@@ -214,6 +214,30 @@ export async function onRequest(context) {
 function injectSmartFix(html, targetUrlStr, targetOrigin) {
     const proxyBase = '/proxy?url=';
     
+    // 0. 注入 base 标签，让相对 URL（图片/CSS/JS）解析到目标站点
+    const safeBaseHref = targetUrlStr.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+    const baseTag = `<base href="${safeBaseHref}">`;
+    const baseRegex = /<base\s[^>]*\/?>/i;
+    if (baseRegex.test(html)) {
+        html = html.replace(baseRegex, baseTag);
+    } else if (html.includes('<head')) {
+        html = html.replace(/(<head[^>]*>)/i, '$1' + baseTag);
+    } else {
+        html = baseTag + html;
+    }
+    
+    // 0.1 修复 meta refresh 重定向走代理
+    html = html.replace(/<meta[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/gi, (match) => {
+        const urlMatch = match.match(/url\s*=\s*["']?([^"'\s>]+)/i);
+        if (urlMatch && urlMatch[1]) {
+            try {
+                const redirectUrl = new URL(urlMatch[1], targetUrlStr).href;
+                return match.replace(urlMatch[1], `/proxy?url=${encodeURIComponent(redirectUrl)}`);
+            } catch (e) {}
+        }
+        return match;
+    });
+    
     // 1. 添加隐藏的 url 字段到所有表单
     html = html.replace(/<form([^>]*)>/gi, (match, attrs) => {
         // 检查是否已经有 action
