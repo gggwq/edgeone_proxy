@@ -249,19 +249,12 @@ function injectSmartFix(html, targetUrlStr, targetOrigin) {
                 fullAction = action;
             } else if (action.startsWith('/')) {
                 fullAction = targetOrigin + action;
-            } else if (action.startsWith('./') || action.startsWith('../')) {
-                // 相对路径，基于当前 targetUrl
-                var base = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-                fullAction = new URL(action, base).href;
+            } else if (action) {
+                fullAction = new URL(action, targetUrl).href;
             } else {
-                // 可能是空 action，使用当前页面
                 fullAction = targetUrl;
             }
             
-            // 构造代理 URL
-            var proxyUrl = proxyBase + encodeURIComponent(fullAction);
-            
-            // 添加表单数据作为查询参数
             var formData = new FormData(form);
             var params = new URLSearchParams();
             for (var pair of formData.entries()) {
@@ -270,10 +263,11 @@ function injectSmartFix(html, targetUrlStr, targetOrigin) {
             
             var paramStr = params.toString();
             if (paramStr) {
-                proxyUrl += (fullAction.includes('?') ? '&' : '?') + paramStr;
+                fullAction += (fullAction.includes('?') ? '&' : '?') + paramStr;
             }
             
-            // 提交到代理 URL
+            var proxyUrl = proxyBase + encodeURIComponent(fullAction);
+            
             if (form.method.toUpperCase() === 'GET') {
                 window.location.href = proxyUrl;
             } else {
@@ -311,11 +305,8 @@ function injectSmartFix(html, targetUrlStr, targetOrigin) {
                     fullUrl = href;
                 } else if (href.startsWith('/')) {
                     fullUrl = targetOrigin + href;
-                } else if (href.startsWith('./') || href.startsWith('../')) {
-                    var base = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-                    fullUrl = new URL(href, base).href;
                 } else {
-                    fullUrl = targetUrl + '/' + href;
+                    fullUrl = new URL(href, targetUrl).href;
                 }
                 
                 window.open(proxyBase + encodeURIComponent(fullUrl), '_blank');
