@@ -108,7 +108,7 @@ export async function onRequest(context) {
             headers: outgoingHeaders,
             method: request.method,
             body: (request.method !== 'GET' && request.method !== 'HEAD') ? request.body : null,
-            redirect: 'follow',
+            redirect: 'manual',
             // 重要：设置 duplex 为 half 以支持流式传输
             duplex: 'half'
         });
@@ -116,11 +116,25 @@ export async function onRequest(context) {
         // 发起请求
         const response = await fetch(modifiedRequest);
 
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+            const location = response.headers.get('location');
+            if (location) {
+                const redirectUrl = new URL(location, targetUrl).href;
+                return new Response(null, {
+                    status: 302,
+                    headers: {
+                        'Location': `/proxy?url=${encodeURIComponent(redirectUrl)}`,
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                });
+            }
+        }
+
         // 修复5: 更完善的响应头处理
         const finalHeaders = new Headers();
 
         // 复制所有响应头（除了某些需要处理的）
-        const skipResponseHeaders = ['content-encoding', 'transfer-encoding'];
+        const skipResponseHeaders = ['content-encoding', 'transfer-encoding', 'set-cookie'];
         for (const [key, value] of response.headers.entries()) {
             if (!skipResponseHeaders.includes(key.toLowerCase())) {
                 finalHeaders.set(key, value);
@@ -137,15 +151,13 @@ export async function onRequest(context) {
         };
 
         // 处理 Set-Cookie 头
-        if (response.headers.get('set-cookie')) {
-            const cookies = response.headers.get('set-cookie').split(/,(?=\s*\w+=)/);
-            for (const cookie of cookies) {
-                const rewritten = rewriteSetCookie(cookie.trim());
+        for (const [key, value] of response.headers.entries()) {
+            if (key.toLowerCase() === 'set-cookie') {
+                const rewritten = rewriteSetCookie(value.trim());
                 if (rewritten) {
                     finalHeaders.append('Set-Cookie', rewritten);
                 }
             }
-            finalHeaders.delete('set-cookie'); // 删除原始 set-cookie
         }
 
         // 添加 CORS 头
@@ -153,35 +165,11 @@ export async function onRequest(context) {
         finalHeaders.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
         finalHeaders.set('Access-Control-Allow-Headers', '*');
 
-        // 修复7: 根据内容类型决定是否使用流式传输
-        const contentType = response.headers.get('content-type') || '';
-        const isText = contentType.includes('text') || 
-                      contentType.includes('json') || 
-                      contentType.includes('xml') ||
-                      contentType.includes('javascript');
-
-        // 对于文本内容，可以尝试读取并可能修改
-        // 对于二进制内容（图片、视频等），直接流式传输
-        const isBinary = contentType.includes('image') ||
-                        contentType.includes('video') ||
-                        contentType.includes('audio') ||
-                        contentType.includes('application/octet-stream');
-
-        if (isBinary) {
-            // 二进制内容：直接返回原始响应体
-            return new Response(response.body, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: finalHeaders
-            });
-        } else {
-            // 文本内容：返回响应（让浏览器自动处理编码）
-            return new Response(response.body, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: finalHeaders
-            });
-        }
+        return new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: finalHeaders
+        });
 
     } catch (error) {
         // 修复8: 更详细的错误信息

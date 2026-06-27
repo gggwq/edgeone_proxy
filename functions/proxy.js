@@ -7,6 +7,28 @@
  * 3. 注入 JS 确保所有导航都通过代理
  */
 
+function isPrivateHost(hostname) {
+    if (hostname.startsWith('[') && hostname.endsWith(']')) {
+        hostname = hostname.slice(1, -1);
+    }
+    if (['localhost', '0.0.0.0', '127.0.0.1', '::1'].includes(hostname.toLowerCase())) {
+        return true;
+    }
+    const ipv4 = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4) {
+        const p = ipv4.slice(1).map(Number);
+        if (p.every(v => v <= 255)) {
+            if (p[0] === 10) return true;
+            if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+            if (p[0] === 192 && p[1] === 168) return true;
+            if (p[0] === 127) return true;
+            if (p[0] === 169 && p[1] === 254) return true;
+            if (p[0] === 0) return true;
+        }
+    }
+    return false;
+}
+
 export async function onRequest(context) {
     const { request } = context;
 
@@ -86,9 +108,13 @@ export async function onRequest(context) {
             return new Response('Only http and https protocols are supported.', { status: 400 });
         }
 
+        if (isPrivateHost(targetUrl.hostname)) {
+            return new Response('Access to internal/private addresses is not allowed.', { status: 403 });
+        }
+
         const outgoingHeaders = new Headers();
         
-        const headersToCopy = ['accept', 'accept-language', 'user-agent', 'cookie', 'referer'];
+        const headersToCopy = ['accept', 'accept-language', 'user-agent', 'referer'];
         for (const headerName of headersToCopy) {
             const value = request.headers.get(headerName);
             if (value) {
@@ -143,10 +169,9 @@ export async function onRequest(context) {
                 .replace(/;\s*SameSite=[^;]*/gi, '; SameSite=None');
         };
 
-        if (response.headers.get('set-cookie')) {
-            const cookies = response.headers.get('set-cookie').split(/,(?=\s*\w+=)/);
-            for (const cookie of cookies) {
-                const rewritten = rewriteSetCookie(cookie.trim());
+        for (const [key, value] of response.headers.entries()) {
+            if (key.toLowerCase() === 'set-cookie') {
+                const rewritten = rewriteSetCookie(value.trim());
                 if (rewritten) {
                     finalHeaders.append('Set-Cookie', rewritten);
                 }
