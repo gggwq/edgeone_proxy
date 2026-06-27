@@ -224,35 +224,79 @@ function injectSmartFix(html, targetUrlStr, targetOrigin) {
         return match;
     });
     
-    // 2. 注入 JavaScript 来修复表单提交
+    // 2. 注入 JavaScript 来修复所有导航（点击、表单、JS跳转）
+    const safeTargetUrl = targetUrlStr.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+    const safeTargetOrigin = targetOrigin.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+    
     const fixScript = `
 <script>
 (function() {
-    var targetUrl = "${targetUrlStr}";
-    var targetOrigin = "${targetOrigin}";
+    var targetUrl = "${safeTargetUrl}";
+    var targetOrigin = "${safeTargetOrigin}";
     var proxyBase = "/proxy?url=";
+    var proxyPrefix = "/proxy?";
+    
+    function toProxyUrl(url) {
+        return proxyBase + encodeURIComponent(url);
+    }
+    
+    function resolveFullUrl(href) {
+        if (href.startsWith('http')) return href;
+        if (href.startsWith('/')) return targetOrigin + href;
+        return new URL(href, targetUrl).href;
+    }
+    
+    function needsProxy(url) {
+        return url && !url.includes(proxyPrefix) && !url.startsWith('#') && !url.startsWith('javascript:');
+    }
+    
+    // 拦截 window.location.assign
+    var _assign = window.location.assign.bind(window.location);
+    window.location.assign = function(url) {
+        url = String(url);
+        if (needsProxy(url)) url = toProxyUrl(resolveFullUrl(url));
+        return _assign(url);
+    };
+    
+    // 拦截 window.location.replace
+    var _replaceLoc = window.location.replace.bind(window.location);
+    window.location.replace = function(url) {
+        url = String(url);
+        if (needsProxy(url)) url = toProxyUrl(resolveFullUrl(url));
+        return _replaceLoc(url);
+    };
+    
+    // 拦截 history.pushState
+    var _pushState = history.pushState.bind(history);
+    history.pushState = function(state, title, url) {
+        if (url && needsProxy(url)) url = toProxyUrl(resolveFullUrl(url));
+        return _pushState(state, title, url);
+    };
+    
+    // 拦截 history.replaceState
+    var _replaceState = history.replaceState.bind(history);
+    history.replaceState = function(state, title, url) {
+        if (url && needsProxy(url)) url = toProxyUrl(resolveFullUrl(url));
+        return _replaceState(state, title, url);
+    };
     
     // 修复所有表单提交
     document.addEventListener('submit', function(e) {
         var form = e.target;
-        
-        // 获取表单的 action
         var action = form.getAttribute('action') || '';
         
-        // 如果 action 不包含 /proxy?，需要重写
-        if (action && !action.includes('/proxy?')) {
+        if (!action || !action.includes(proxyPrefix)) {
             e.preventDefault();
             
-            // 构造完整的目标 URL
             var fullAction;
-            if (action.startsWith('http')) {
+            if (!action) {
+                fullAction = targetUrl;
+            } else if (action.startsWith('http')) {
                 fullAction = action;
             } else if (action.startsWith('/')) {
                 fullAction = targetOrigin + action;
-            } else if (action) {
-                fullAction = new URL(action, targetUrl).href;
             } else {
-                fullAction = targetUrl;
+                fullAction = new URL(action, targetUrl).href;
             }
             
             var formData = new FormData(form);
@@ -260,22 +304,20 @@ function injectSmartFix(html, targetUrlStr, targetOrigin) {
             for (var pair of formData.entries()) {
                 params.append(pair[0], pair[1]);
             }
-            
             var paramStr = params.toString();
             if (paramStr) {
                 fullAction += (fullAction.includes('?') ? '&' : '?') + paramStr;
             }
             
-            var proxyUrl = proxyBase + encodeURIComponent(fullAction);
+            var url = toProxyUrl(fullAction);
             
             if (form.method.toUpperCase() === 'GET') {
-                window.location.href = proxyUrl;
+                window.location.assign(url);
             } else {
-                // POST 请求，创建新表单
                 var newForm = document.createElement('form');
                 newForm.method = 'POST';
-                newForm.action = proxyUrl;
-                
+                newForm.action = url;
+                newForm.style.display = 'none';
                 for (var pair of formData.entries()) {
                     var input = document.createElement('input');
                     input.type = 'hidden';
@@ -283,7 +325,6 @@ function injectSmartFix(html, targetUrlStr, targetOrigin) {
                     input.value = pair[1];
                     newForm.appendChild(input);
                 }
-                
                 document.body.appendChild(newForm);
                 newForm.submit();
             }
@@ -295,21 +336,10 @@ function injectSmartFix(html, targetUrlStr, targetOrigin) {
         var link = e.target.closest('a');
         if (link && link.href) {
             var href = link.getAttribute('href');
-            
-            // 如果链接不是代理 URL，重写
-            if (href && !href.includes('/proxy?') && !href.startsWith('#') && !href.startsWith('javascript:')) {
+            if (needsProxy(href)) {
                 e.preventDefault();
-                
-                var fullUrl;
-                if (href.startsWith('http')) {
-                    fullUrl = href;
-                } else if (href.startsWith('/')) {
-                    fullUrl = targetOrigin + href;
-                } else {
-                    fullUrl = new URL(href, targetUrl).href;
-                }
-                
-                window.open(proxyBase + encodeURIComponent(fullUrl), '_blank');
+                e.stopPropagation();
+                window.open(toProxyUrl(resolveFullUrl(href)), '_blank');
             }
         }
     }, true);
